@@ -41,5 +41,6 @@ setGlobalOptions({ maxInstances: 10 })
 import { ingestCase } from './functions/ingestCase.js'
 import { processDbscanJob } from './functions/processDbscanJob.js'
 import { cleanupOldData } from './functions/cleanupOldData.js'
+import { ingestCaseHttp } from './functions/ingestCaseHttp.js'
 
-export { ingestCase, processDbscanJob, cleanupOldData }
+export { ingestCase, processDbscanJob, cleanupOldData, ingestCaseHttp }
