@@ -205,118 +205,123 @@ async function enqueueDbscanJob(
 
 // --- Función Principal 'onRequest' ---
 
-export const ingestCaseHttp = onRequest(async (req, res) => {
-  // CAMBIO: Nombre y firma (req, res)
-  // 1. Validar Método HTTP (Opcional, pero bueno para ingesta)
-  if (req.method !== 'POST') {
-    return res.status(405).send({
-      ok: false,
-      status: 'error',
-      message: 'Method Not Allowed. Use POST.',
-    })
-  }
+export const ingestCaseHttp = onRequest(
+  {
+    maxInstances: 5,
+  },
+  async (req, res) => {
+    // CAMBIO: Nombre y firma (req, res)
+    // 1. Validar Método HTTP (Opcional, pero bueno para ingesta)
+    if (req.method !== 'POST') {
+      return res.status(405).send({
+        ok: false,
+        status: 'error',
+        message: 'Method Not Allowed. Use POST.',
+      })
+    }
 
-  // 2. Acceso y Validación del Payload
-  const { event_id, event_time_utc, lat, lng, condition } = req.body // CAMBIO: Usar req.body
+    // 2. Acceso y Validación del Payload
+    const { event_id, event_time_utc, lat, lng, condition } = req.body // CAMBIO: Usar req.body
 
-  if (!event_id || !event_time_utc || !lat || !lng || !condition) {
-    logger.error('Payload incompleto', { payload: req.body })
-    // CAMBIO: Enviar respuesta HTTP 400 (Bad Request)
-    return res.status(400).send({
-      ok: false,
-      status: 'error',
-      message:
-        'Payload incompleto. Faltan event_id, event_time_utc, lat, lng o condition.',
-    })
-  }
+    if (!event_id || !event_time_utc || !lat || !lng || !condition) {
+      logger.error('Payload incompleto', { payload: req.body })
+      // CAMBIO: Enviar respuesta HTTP 400 (Bad Request)
+      return res.status(400).send({
+        ok: false,
+        status: 'error',
+        message:
+          'Payload incompleto. Faltan event_id, event_time_utc, lat, lng o condition.',
+      })
+    }
 
-  try {
-    // 3. Cálculos Geo/Tiempo
-    const eventTime = new Date(event_time_utc)
-    const now = new Date()
-    const hourISO = floorToHourISO(eventTime)
-    const h3 = toH3(lat, lng, config.H3_RES)
-    const geohash = toGeohash(lat, lng, config.GEOHASH_PRECISION)
+    try {
+      // 3. Cálculos Geo/Tiempo
+      const eventTime = new Date(event_time_utc)
+      const now = new Date()
+      const hourISO = floorToHourISO(eventTime)
+      const h3 = toH3(lat, lng, config.H3_RES)
+      const geohash = toGeohash(lat, lng, config.GEOHASH_PRECISION)
 
-    // 4. Transacción 1: Ingesta, Idempotencia y Bucket
-    let idempotencyHit = false
-    await db.runTransaction(async (tx) => {
-      // --- LECTURAS (AL INICIO DE TX-1) ---
-      const dedupRef = db.doc(paths.dedupDoc(event_id))
-      const dedupSnap = await tx.get(dedupRef)
+      // 4. Transacción 1: Ingesta, Idempotencia y Bucket
+      let idempotencyHit = false
+      await db.runTransaction(async (tx) => {
+        // --- LECTURAS (AL INICIO DE TX-1) ---
+        const dedupRef = db.doc(paths.dedupDoc(event_id))
+        const dedupSnap = await tx.get(dedupRef)
 
-      // --- LÓGICA ---
-      if (dedupSnap.exists) {
-        idempotencyHit = true
-        return // Salir de la transacción
+        // --- LÓGICA ---
+        if (dedupSnap.exists) {
+          idempotencyHit = true
+          return // Salir de la transacción
+        }
+
+        // --- ESCRITURAS (AL FINAL DE TX-1) ---
+        const expireAt = DateTime.fromJSDate(now)
+          .plus({ hours: config.IDEMPOTENCY_TTL_HOURS })
+          .toJSDate()
+        tx.create(dedupRef, { created_at: now, expire_at: expireAt })
+
+        const caseRef = db.doc(paths.caseDoc(event_id))
+        tx.create(caseRef, {
+          ...req.body, // CAMBIO: Usar req.body
+          location: new GeoPoint(lat, lng),
+          h3: h3,
+          geohash: geohash,
+          created_at: eventTime,
+          ingested_at: now,
+        })
+
+        const bucketRef = db.doc(paths.bucket1hDoc(condition, h3, hourISO))
+        tx.set(bucketRef, { count: FieldValue.increment(1) }, { merge: true })
+      }) // Fin de la Transacción 1
+
+      if (idempotencyHit) {
+        // CAMBIO: Respuesta HTTP 202 (Accepted) para duplicados
+        return res
+          .status(202)
+          .send({ ok: true, status: 'duplicate_skipped', event_id })
       }
 
-      // --- ESCRITURAS (AL FINAL DE TX-1) ---
-      const expireAt = DateTime.fromJSDate(now)
-        .plus({ hours: config.IDEMPOTENCY_TTL_HOURS })
-        .toJSDate()
-      tx.create(dedupRef, { created_at: now, expire_at: expireAt })
+      // 5. Transacción 2: Actualización del Rollup
+      await runRollupUpdateTransaction(condition, h3, hourISO, now)
 
-      const caseRef = db.doc(paths.caseDoc(event_id))
-      tx.create(caseRef, {
-        ...req.body, // CAMBIO: Usar req.body
-        location: new GeoPoint(lat, lng),
-        h3: h3,
-        geohash: geohash,
-        created_at: eventTime,
-        ingested_at: now,
+      // 6. Post-Transacción: Cálculo de Densidad y Encolado de Job
+      const neighborsH3 = centerWithKRing1(h3)
+      const density_T1 = await calculateDensity(condition, neighborsH3)
+
+      let alertTriggered = false
+      if (density_T1 >= config.MIN_PTS_H3) {
+        logger.info(
+          `H3 density threshold met for ${condition}|${h3} (${density_T1} >= ${config.MIN_PTS_H3})`,
+        )
+        console.log('enqueueing dbscan job')
+        logger.info('enqueueing dbscan job')
+        await enqueueDbscanJob(condition, h3, neighborsH3, density_T1, now)
+        alertTriggered = true
+      }
+
+      // 7. Respuesta Exitosa
+      // CAMBIO: Enviar respuesta HTTP 201 (Created)
+      return res.status(201).send({
+        ok: true,
+        event_id,
+        h3,
+        density_T1,
+        alert_triggered: alertTriggered,
+        message: 'Case ingested and processed successfully.',
       })
-
-      const bucketRef = db.doc(paths.bucket1hDoc(condition, h3, hourISO))
-      tx.set(bucketRef, { count: FieldValue.increment(1) }, { merge: true })
-    }) // Fin de la Transacción 1
-
-    if (idempotencyHit) {
-      // CAMBIO: Respuesta HTTP 202 (Accepted) para duplicados
-      return res
-        .status(202)
-        .send({ ok: true, status: 'duplicate_skipped', event_id })
+    } catch (error) {
+      logger.error('Error fatal en ingestCaseHttp', {
+        error,
+        data: req.body,
+        stack: error.stack,
+      })
+      // CAMBIO: Enviar respuesta HTTP 500 (Internal Server Error)
+      return res.status(500).send({
+        ok: false,
+        status: 'error',
+        message: 'Error interno al procesar el caso.',
+      })
     }
-
-    // 5. Transacción 2: Actualización del Rollup
-    await runRollupUpdateTransaction(condition, h3, hourISO, now)
-
-    // 6. Post-Transacción: Cálculo de Densidad y Encolado de Job
-    const neighborsH3 = centerWithKRing1(h3)
-    const density_T1 = await calculateDensity(condition, neighborsH3)
-
-    let alertTriggered = false
-    if (density_T1 >= config.MIN_PTS_H3) {
-      logger.info(
-        `H3 density threshold met for ${condition}|${h3} (${density_T1} >= ${config.MIN_PTS_H3})`,
-      )
-      console.log('enqueueing dbscan job')
-      logger.info('enqueueing dbscan job')
-      await enqueueDbscanJob(condition, h3, neighborsH3, density_T1, now)
-      alertTriggered = true
-    }
-
-    // 7. Respuesta Exitosa
-    // CAMBIO: Enviar respuesta HTTP 201 (Created)
-    return res.status(201).send({
-      ok: true,
-      event_id,
-      h3,
-      density_T1,
-      alert_triggered: alertTriggered,
-      message: 'Case ingested and processed successfully.',
-    })
-  } catch (error) {
-    logger.error('Error fatal en ingestCaseHttp', {
-      error,
-      data: req.body,
-      stack: error.stack,
-    })
-    // CAMBIO: Enviar respuesta HTTP 500 (Internal Server Error)
-    return res.status(500).send({
-      ok: false,
-      status: 'error',
-      message: 'Error interno al procesar el caso.',
-    })
-  }
-})
+  },
+)
