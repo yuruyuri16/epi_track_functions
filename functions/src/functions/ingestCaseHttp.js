@@ -153,6 +153,8 @@ async function enqueueDbscanJob(
   density_T1,
   now,
 ) {
+  console.log('dbscan job started')
+  logger.info('dbscan job started')
   const hourKey = getHourKey(now)
   const winAnchorISO = floorToHourISO(now)
   const clusterId = paths.clusterId(condition, h3Center, hourKey)
@@ -164,6 +166,8 @@ async function enqueueDbscanJob(
       if (alertSnap.exists && alertSnap.data().job_status === 'enqueued') {
         tx.update(alertRef, { density_T1: density_T1, last_seen_at: now })
         shouldEnqueue = false
+        console.log('dbscan job already enqueued')
+        logger.info('dbscan job already enqueued')
         return
       }
       const alertData = {
@@ -182,11 +186,15 @@ async function enqueueDbscanJob(
       tx.set(alertRef, alertData, { merge: true })
       shouldEnqueue = true
     })
+    console.log('should enqueue', shouldEnqueue)
+    logger.info('should enqueue', shouldEnqueue)
     if (shouldEnqueue) {
       const sinceUTC = DateTime.fromJSDate(now)
         .minus({ hours: config.ROLLUP_WINDOW_HOURS })
         .toISO()
       const payload = { clusterId, condition, h3Center, neighborsH3, sinceUTC }
+      console.log('enqueuing dbscan job')
+      logger.info('enqueuing dbscan job')
       await taskQueue.enqueue(payload)
       logger.info(`DBSCAN job enqueued for cluster ${clusterId}`, payload)
     }
@@ -282,6 +290,8 @@ export const ingestCaseHttp = onRequest(async (req, res) => {
       logger.info(
         `H3 density threshold met for ${condition}|${h3} (${density_T1} >= ${config.MIN_PTS_H3})`,
       )
+      console.log('enqueueing dbscan job')
+      logger.info('enqueueing dbscan job')
       await enqueueDbscanJob(condition, h3, neighborsH3, density_T1, now)
       alertTriggered = true
     }

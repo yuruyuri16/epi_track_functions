@@ -154,17 +154,24 @@ async function enqueueDbscanJob(
   density_T1,
   now,
 ) {
-  console.log('enqueue dbscan job started')
+  console.log('enqueue dbscan job | started')
   const hourKey = getHourKey(now)
+  console.log('enqueue dbscan job | hourKey', hourKey)
   const winAnchorISO = floorToHourISO(now)
+  console.log('enqueue dbscan job | winAnchorISO', winAnchorISO)
   const clusterId = paths.clusterId(condition, h3Center, hourKey)
+  console.log('enqueue dbscan job | clusterId', clusterId)
   const alertRef = db.doc(paths.alertDoc(clusterId))
+  console.log('enqueue dbscan job | alertRef', alertRef)
   let shouldEnqueue = false
   try {
+    console.log('enqueue dbscan job | starting transaction')
     await db.runTransaction(async (tx) => {
-      console.log('tx started')
+      console.log('enqueue dbscan job | transaction started')
       const alertSnap = await tx.get(alertRef)
+      console.log('enqueue dbscan job | alert snap', alertSnap)
       if (alertSnap.exists && alertSnap.data().job_status === 'enqueued') {
+        console.log('enqueue dbscan job | alert already enqueued return')
         tx.update(alertRef, { density_T1: density_T1, last_seen_at: now })
         shouldEnqueue = false
         return
@@ -182,12 +189,13 @@ async function enqueueDbscanJob(
         first_seen_at: alertSnap.exists ? alertSnap.data().first_seen_at : now,
         last_seen_at: now,
       }
+      console.log('enqueue dbscan job | alert set')
       tx.set(alertRef, alertData, { merge: true })
       shouldEnqueue = true
       console.log('tx finished')
     })
+    console.log('enqueue dbscan job | should enqueue', shouldEnqueue)
     if (shouldEnqueue) {
-      console.log('should enqueue', shouldEnqueue)
       const sinceUTC = DateTime.fromJSDate(now)
         .minus({ hours: config.ROLLUP_WINDOW_HOURS })
         .toISO()
@@ -196,6 +204,8 @@ async function enqueueDbscanJob(
       logger.info(`DBSCAN job enqueued for cluster ${clusterId}`, payload)
     }
   } catch (error) {
+    console.log('enqueue dbscan job | error')
+    console.log(error)
     logger.error(`Failed to enqueue job for cluster ${clusterId}`, { error })
   }
 }
@@ -262,14 +272,20 @@ export const ingestCase = onCall(async (request) => {
 
     // 3. Transacción 2: Actualización del Rollup
     // (Se ejecuta solo si la ingesta fue exitosa y no fue duplicada)
+    console.log('ingestCase | running rollup update transaction')
     await runRollupUpdateTransaction(condition, h3, hourISO, now)
+    console.log('ingestCase | rollup update transaction finished')
 
     // 4. Post-Transacción: Cálculo de Densidad y Encolado de Job
     const neighborsH3 = centerWithKRing1(h3)
+    console.log('ingestCase | neighborsH3', neighborsH3)
     const density_T1 = await calculateDensity(condition, neighborsH3)
+    console.log('ingestCase | density_T1', density_T1)
 
     let alertTriggered = false
+    console.log('ingestCase | checking density threshold')
     if (density_T1 >= config.MIN_PTS_H3) {
+      console.log('ingestCase | density threshold met')
       logger.info(
         `H3 density threshold met for ${condition}|${h3} (${density_T1} >= ${config.MIN_PTS_H3})`,
       )
@@ -279,7 +295,7 @@ export const ingestCase = onCall(async (request) => {
       alertTriggered = true
       console.log('ingestCase | alert triggered')
     }
-
+    console.log('ingestCase | success with alert triggered:', alertTriggered)
     // 5. Respuesta Exitosa
     return {
       ok: true,
@@ -289,6 +305,9 @@ export const ingestCase = onCall(async (request) => {
       alert_triggered: alertTriggered,
     }
   } catch (error) {
+    console.log('ingestCase | error')
+    console.log(error)
+    console.log(error.stack)
     logger.error('Error fatal en ingestCase', {
       error,
       data: request.data,

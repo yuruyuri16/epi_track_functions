@@ -81,6 +81,7 @@ function analyzeTurfResults(clusteredCollection) {
 // --- Función Principal 'onTaskDispatched' ---
 
 export const processDbscanJob = onTaskDispatched(async (request) => {
+  console.log('processDbscanJob | started')
   const { clusterId, condition, neighborsH3, sinceUTC } = request.data
   const alertRef = db.doc(paths.alertDoc(clusterId))
 
@@ -88,11 +89,13 @@ export const processDbscanJob = onTaskDispatched(async (request) => {
 
   try {
     // 1. Marcar el job como 'processing'
+    console.log('processDbscanJob | 1 updating alert status to processing')
     await alertRef.update({
       job_status: 'processing',
       job_started_at: FieldValue.serverTimestamp(),
     })
 
+    console.log('processDbscanJob | 2 getting points as geojson')
     // 2. Obtener los puntos como GeoJSON
     const pointsCollection = await getPointsAsGeoJSON(
       condition,
@@ -100,19 +103,23 @@ export const processDbscanJob = onTaskDispatched(async (request) => {
       sinceUTC,
     )
 
+    console.log('processDbscanJob | 3 checking points count')
     if (pointsCollection.features.length < config.MIN_PTS_DBSCAN) {
       logger.warn(
         `Job ${clusterId} abortado: Puntos insuficientes (${pointsCollection.features.length})`,
       )
+      console.log('processDbscanJob | insufficient points')
       await alertRef.update({
         job_status: 'completed',
         state: 'rejected',
         confirm_label: 'insufficient_points',
         job_finished_at: FieldValue.serverTimestamp(),
       })
+      console.log('processDbscanJob | finished')
       return
     }
 
+    console.log('processDbscanJob | 3 executing dbscan')
     // 3. Ejecutar DBSCAN (¡La llamada ahora es mucho más limpia!)
     const clusteredCollection = turfDbscan(
       pointsCollection,
@@ -124,16 +131,18 @@ export const processDbscanJob = onTaskDispatched(async (request) => {
     )
 
     // 4. Analizar resultados
+    console.log('processDbscanJob | 4 analyzing results')
     const { clustersMap, noiseCount, totalPoints } =
       analyzeTurfResults(clusteredCollection)
     const pointsInClusters = totalPoints - noiseCount
 
+    console.log('processDbscanJob | checking clusters count')
     if (clustersMap.size > 0) {
       // Usamos .size en lugar de .length
       logger.info(
         `¡BROTE CONFIRMADO! Job ${clusterId} encontró ${clustersMap.size} clúster(s).`,
       )
-
+      console.log('processDbscanJob | brote confirmado')
       // Convertimos el Map a un objeto simple, aplicando el .slice() aquí
       const clustersPreviewMap = {}
       let count = 0
@@ -144,12 +153,7 @@ export const processDbscanJob = onTaskDispatched(async (request) => {
         clustersPreviewMap[`cluster_${turfClusterId}`] = caseIds
         count++
       }
-      console.log('clustersPreviewMap')
-      for (const [turfClusterId, caseIds] of Object.entries(
-        clustersPreviewMap,
-      )) {
-        console.log(turfClusterId, caseIds)
-      }
+      console.log('processDbscanJob | updating alert status to completed')
       await alertRef.update({
         job_status: 'completed',
         state: 'confirmed',
@@ -163,9 +167,10 @@ export const processDbscanJob = onTaskDispatched(async (request) => {
           clusters_preview: clustersPreviewMap,
         },
       })
-      console.log('brote confirmado')
+      console.log('processDbscanJob | confirmed outbreak')
     } else {
       logger.info(`Falsa Alarma: Job ${clusterId} solo encontró ruido.`)
+      console.log('processDbscanJob | false alarm')
       await alertRef.update({
         job_status: 'completed',
         state: 'rejected',
@@ -178,8 +183,11 @@ export const processDbscanJob = onTaskDispatched(async (request) => {
           total_points_analyzed: totalPoints,
         },
       })
+      console.log('processDbscanJob | false alarm')
     }
   } catch (error) {
+    console.log('processDbscanJob | error')
+    console.log(error)
     logger.error(`Error fatal en processDbscanJob ${clusterId}`, {
       error,
       stack: error.stack,
