@@ -31,10 +31,13 @@ async function getPointsAsGeoJSON(condition, neighborsH3, sinceUTC) {
 
   const snapshot = await query.get()
 
+  console.log('getPointsAsGeoJSON | snapshot size', snapshot.size)
+
   if (snapshot.empty) {
-    return featureCollection([]) // Devolver una colección vacía
+    return featureCollection([])
   }
 
+  console.log('getPointsAsGeoJSON | mapping docs to features')
   // Mapea los documentos de Firestore a 'Features' de GeoJSON
   const features = snapshot.docs.map((doc) => {
     const data = doc.data()
@@ -47,6 +50,7 @@ async function getPointsAsGeoJSON(condition, neighborsH3, sinceUTC) {
     return turfPoint(coordinates, properties)
   })
 
+  console.log('getPointsAsGeoJSON | returning feature collection')
   return featureCollection(features)
 }
 
